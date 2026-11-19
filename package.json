@@ -1,15 +1,32 @@
 {
   "name": "my-site",
   "version": "1.0.0",
+  "type": "module",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "build": "rm -rf dist && mkdir -p dist/prisma && cp server.js dist/server.mjs && cp service.mjs dist/service.mjs && cp prisma/contract.json dist/prisma/contract.json"
   },
   "dependencies": {
     "express": "^4.19.2",
     "express-session": "^1.18.0",
     "connect-pg-simple": "^9.0.1",
     "pg": "^8.11.5",
-    "bcryptjs": "^2.4.3"
+    "bcryptjs": "^2.4.3",
+    "arktype": "^2.2.3",
+    "@prisma/composer": "0.38.0",
+    "@prisma/composer-prisma-cloud": "0.38.0",
+    "@prisma/orm-postgres": "8.0.0-rc.23",
+    "effect": "4.0.5"
+  },
+  "devDependencies": {
+    "prisma": "8.0.0-rc.33"
+  },
+  "overrides": {
+    "effect": "4.0.5",
+    "@effect/vitest": "4.0.5",
+    "@effect/platform-bun": "4.0.5",
+    "@effect/platform-node": "4.0.5",
+    "@effect/platform-node-shared": "4.0.5"
   }
 }
