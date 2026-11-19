@@ -1,0 +1,31 @@
+// use prisma-8
+
+model users {
+  id            Int     @id @default(autoincrement())
+  username      String(storage: varchar, length: 50) @unique
+  password_hash String(storage: varchar, length: 100)
+  role          String(storage: varchar, length: 20) @default("user")
+  created_at    DateTime(storage: timestamp) @default(now())
+}
+
+model sections {
+  id         Int  @id @default(autoincrement())
+  name       String(storage: varchar, length: 100)
+  sort_order Int? @default(0)
+}
+
+model resources {
+  id         Int      @id @default(autoincrement())
+  section_id Int
+  title      String(storage: varchar, length: 200)
+  content    String?
+  created_at DateTime(storage: timestamp) @default(now())
+}
+
+model session {
+  sid    String  @id
+  sess   Json
+  expire DateTime(storage: timestamp)
+
+  @@index([expire], name: "IDX_session_expire")
+}

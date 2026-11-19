@@ -1,54 +1,31 @@
-const express = require('express');
-const session = require('express-session');
-const bcrypt = require('bcryptjs');
-const { Pool } = require('pg');
-const pgSession = require('connect-pg-simple')(session);
+import express from 'express';
+import session from 'express-session';
+import bcrypt from 'bcryptjs';
+import pg from 'pg';
+import connectPgSimple from 'connect-pg-simple';
+import service from './service.mjs';
+
+const { Pool } = pg;
+const pgSession = connectPgSimple(session);
 
 const app = express();
-const PORT = process.env.PORT || 7860; // ⚠️ Hugging Face 必须用 7860 端口
+const PORT = service.port();
 
-// 连接云数据库
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false }
-});
+// 依赖与配置都来自服务声明，由 Compute / prisma dev 注入，不读环境变量
+const { db } = service.load();
+const { sessionSecret } = service.input();
+const orm = db.client.orm.public;
 
-// 初始化数据库表
+// 连接数据库（连接串来自服务声明的数据库绑定）
+const pool = new Pool({ connectionString: db.url });
+
+// 初始化种子数据（表结构由 migrations/ 里的迁移创建）
 async function initDB() {
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS users (
-      id SERIAL PRIMARY KEY,
-      username VARCHAR(50) UNIQUE NOT NULL,
-      password_hash VARCHAR(100) NOT NULL,
-      role VARCHAR(20) NOT NULL DEFAULT 'user',
-      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    );
-    CREATE TABLE IF NOT EXISTS sections (
-      id SERIAL PRIMARY KEY,
-      name VARCHAR(100) NOT NULL,
-      sort_order INTEGER DEFAULT 0
-    );
-    CREATE TABLE IF NOT EXISTS resources (
-      id SERIAL PRIMARY KEY,
-      section_id INTEGER NOT NULL,
-      title VARCHAR(200) NOT NULL,
-      content TEXT,
-      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    );
-    CREATE TABLE IF NOT EXISTS "session" (
-      "sid" varchar NOT NULL COLLATE "default",
-      "sess" json NOT NULL,
-      "expire" timestamp(6) NOT NULL,
-      CONSTRAINT "session_pkey" PRIMARY KEY ("sid")
-    );
-    CREATE INDEX IF NOT EXISTS "IDX_session_expire" ON "session" ("expire");
-  `);
-
   // 初始化管理员
-  const adminRes = await pool.query("SELECT id FROM users WHERE role='admin' LIMIT 1");
-  if (adminRes.rowCount === 0) {
+  const admin = await orm.users.where({ role: 'admin' }).first();
+  if (!admin) {
     const hash = bcrypt.hashSync('admin123', 10);
-    await pool.query("INSERT INTO users (username,password_hash,role) VALUES ($1,$2,$3)", ['admin', hash, 'admin']);
+    await orm.users.create({ username: 'admin', password_hash: hash, role: 'admin' });
     console.log('初始管理员：admin / admin123');
   }
 }
@@ -57,7 +34,7 @@ initDB();
 app.use(express.json());
 app.use(session({
   store: new pgSession({ pool: pool, tableName: 'session' }),
-  secret: process.env.SESSION_SECRET || 'super-secret-key-2024',
+  secret: sessionSecret.expose(),
   resave: false,
   saveUninitialized: false,
   cookie: { httpOnly: true, secure: false, maxAge: 7 * 24 * 3600 * 1000 }
@@ -70,10 +47,10 @@ const requireAdmin = (req, res, next) => (req.session.user && req.session.user.r
 app.post('/api/login', async (req, res) => {
   const { username, password } = req.body || {};
   if (!username || !password) return res.status(400).json({ error: '请输入账号密码' });
-  const { rows } = await pool.query('SELECT * FROM users WHERE username=$1', [username]);
-  if (rows.length === 0 || !bcrypt.compareSync(password, rows[0].password_hash))
+  const user = await orm.users.where({ username }).first();
+  if (!user || !bcrypt.compareSync(password, user.password_hash))
     return res.status(401).json({ error: '账号或密码错误' });
-  req.session.user = { id: rows[0].id, username: rows[0].username, role: rows[0].role };
+  req.session.user = { id: user.id, username: user.username, role: user.role };
   res.json({ ok: true, user: req.session.user });
 });
 
@@ -93,25 +70,25 @@ app.get('/', (req, res) => {
 
 /* ---------- 分区接口 ---------- */
 app.get('/api/admin/sections', requireAdmin, async (req, res) => {
-  const { rows } = await pool.query('SELECT * FROM sections ORDER BY sort_order,id');
+  const rows = await orm.sections.orderBy([(s) => s.sort_order.asc(), (s) => s.id.asc()]).all();
   res.json(rows);
 });
 app.post('/api/admin/sections', requireAdmin, async (req, res) => {
   const { name, sort_order } = req.body || {};
   if (!name) return res.status(400).json({ error: '分区名不能为空' });
-  const { rows } = await pool.query('INSERT INTO sections (name,sort_order) VALUES ($1,$2) RETURNING id', [name, Number(sort_order) || 0]);
-  res.json({ ok: true, id: rows[0].id });
+  const row = await orm.sections.create({ name, sort_order: Number(sort_order) || 0 });
+  res.json({ ok: true, id: row.id });
 });
 app.delete('/api/admin/sections/:id', requireAdmin, async (req, res) => {
   const id = Number(req.params.id);
-  await pool.query('DELETE FROM resources WHERE section_id=$1', [id]);
-  await pool.query('DELETE FROM sections WHERE id=$1', [id]);
+  await orm.resources.where({ section_id: id }).deleteAll();
+  await orm.sections.where({ id }).delete();
   res.json({ ok: true });
 });
 
 /* ---------- 账户接口 ---------- */
 app.get('/api/admin/users', requireAdmin, async (req, res) => {
-  const { rows } = await pool.query('SELECT id,username,role,created_at FROM users ORDER BY id');
+  const rows = await orm.users.select('id', 'username', 'role', 'created_at').orderBy((u) => u.id.asc()).all();
   res.json(rows);
 });
 app.post('/api/admin/users', requireAdmin, async (req, res) => {
@@ -119,46 +96,45 @@ app.post('/api/admin/users', requireAdmin, async (req, res) => {
   if (!username || !password) return res.status(400).json({ error: '账号密码不能为空' });
   if (username.length < 3) return res.status(400).json({ error: '账号至少3位' });
   if (password.length < 6) return res.status(400).json({ error: '密码至少6位' });
-  const check = await pool.query('SELECT id FROM users WHERE username=$1', [username]);
-  if (check.rowCount > 0) return res.status(400).json({ error: '账号已存在' });
+  const existing = await orm.users.where({ username }).first();
+  if (existing) return res.status(400).json({ error: '账号已存在' });
   const hash = bcrypt.hashSync(password, 10);
-  await pool.query('INSERT INTO users (username,password_hash,role) VALUES ($1,$2,$3)', [username, hash, role === 'admin' ? 'admin' : 'user']);
+  await orm.users.create({ username, password_hash: hash, role: role === 'admin' ? 'admin' : 'user' });
   res.json({ ok: true });
 });
 app.delete('/api/admin/users/:id', requireAdmin, async (req, res) => {
   const id = Number(req.params.id);
   if (id === req.session.user.id) return res.status(400).json({ error: '不能删除自己' });
-  await pool.query('DELETE FROM users WHERE id=$1', [id]);
+  await orm.users.where({ id }).delete();
   res.json({ ok: true });
 });
 
 /* ---------- 资源接口 ---------- */
 app.get('/api/admin/resources', requireAdmin, async (req, res) => {
-  const { rows } = await pool.query('SELECT * FROM resources ORDER BY id DESC');
+  const rows = await orm.resources.orderBy((r) => r.id.desc()).all();
   res.json(rows);
 });
 app.post('/api/admin/resources', requireAdmin, async (req, res) => {
   const { section_id, title, content } = req.body || {};
   if (!section_id || !title) return res.status(400).json({ error: '分区和标题必填' });
-  const { rows } = await pool.query('INSERT INTO resources (section_id,title,content) VALUES ($1,$2,$3) RETURNING id', [Number(section_id), title, content || '']);
-  res.json({ ok: true, id: rows[0].id });
+  const row = await orm.resources.create({ section_id: Number(section_id), title, content: content || '' });
+  res.json({ ok: true, id: row.id });
 });
 app.delete('/api/admin/resources/:id', requireAdmin, async (req, res) => {
-  await pool.query('DELETE FROM resources WHERE id=$1', [Number(req.params.id)]);
+  await orm.resources.where({ id: Number(req.params.id) }).delete();
   res.json({ ok: true });
 });
 
 /* ---------- 前台数据接口 ---------- */
 app.get('/api/sections', requireLogin, async (req, res) => {
-  const { rows } = await pool.query('SELECT * FROM sections ORDER BY sort_order,id');
+  const rows = await orm.sections.orderBy([(s) => s.sort_order.asc(), (s) => s.id.asc()]).all();
   res.json(rows);
 });
 app.get('/api/resources', requireLogin, async (req, res) => {
   const sid = Number(req.query.section_id);
-  let query = 'SELECT * FROM resources ORDER BY id DESC';
-  let params = [];
-  if (sid) { query = 'SELECT * FROM resources WHERE section_id=$1 ORDER BY id DESC'; params = [sid]; }
-  const { rows } = await pool.query(query, params);
+  const rows = sid
+    ? await orm.resources.where({ section_id: sid }).orderBy((r) => r.id.desc()).all()
+    : await orm.resources.orderBy((r) => r.id.desc()).all();
   res.json(rows);
 });
 
